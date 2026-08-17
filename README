@@ -1,0 +1,5 @@
+# RecursiveMAS MK2
+
+RecursiveMAS_MK2 is an extension of the Recursive_MAS paper. I plan to do two things:
+- Extend the paper to use bigger models and see if the results can be reproduced
+- If the above is successful, I also plan to check if the method given by the paper can work on multiple multi-tiered system (MAS) or only a single MAS.
