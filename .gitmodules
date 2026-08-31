@@ -1,0 +1,3 @@
+[submodule "RecursiveMAS"]
+	path = RecursiveMAS
+	url = https://github.com/RecursiveMAS/RecursiveMAS.git
