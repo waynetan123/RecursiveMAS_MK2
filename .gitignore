@@ -1,0 +1,23 @@
+# Secrets — never commit
+.env
+keys.txt
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# OpenRouter response cache — large and regenerable
+screening/.cache/
+
+# Benchmarks
+benchmarks/*.jsonl
+
+# HuggingFace dataset cache 
+.hf_cache/
+
+# Claude
+.claude
+
+

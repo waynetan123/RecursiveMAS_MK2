@@ -1,0 +1,128 @@
+# Project definition for RecursiveMAS MK2.
+#
+# Covers the `screening/` package only. RecursiveMAS/ is a vendored upstream
+# checkout carrying its own .git and its own requirements.txt (the GPU training
+# stack); it is deliberately not packaged, not installed, and never written to.
+#
+# INSTALL EDITABLE, ALWAYS:
+#
+#     pip install -e .
+#
+# screening/config.py resolves the vendored harness relative to its own file
+# (REPO_ROOT = Path(__file__).parent.parent). A non-editable install copies the
+# package into site-packages, REPO_ROOT resolves there instead, and the vendored
+# loaders cannot be found. The failure is a loud ImportError, not a silent one,
+# but there is no reason to meet it.
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+
+[project]
+name = "recursivemas-mk2"
+version = "0.1.0"
+description = "Scaling RecursiveMAS (arXiv:2604.25917) to 31B-class backbones; Step 1 benchmark screening."
+readme = { file = "README", content-type = "text/markdown" }
+authors = [{ name = "Wayne Tan", email = "wayne.tan@splashtop.com" }]
+
+# Verified on 3.14.6 (macOS arm64), which is what the pins below were resolved
+# against. Nothing in screening/ needs 3.14 specifically — the syntax floor is
+# 3.10 — so widen this if a collaborator is on an older interpreter and the
+# pinned wheels resolve for them.
+requires-python = ">=3.14"
+
+# Guards against an accidental `twine upload`. This repository's audit trail
+# contains gated dataset contents; it is not distributable.
+classifiers = ["Private :: Do Not Upload"]
+
+# Dependancies
+dependencies = [
+  # OpenRouter client and configuration.
+  "httpx==0.28.1",
+  "python-dotenv==1.2.3",
+
+  # Required by the vendored loaders in RecursiveMAS/inference/.
+  "datasets==5.0.1",
+  "huggingface_hub==1.29.0",
+  "tqdm==4.70.0",
+
+  # transformers is imported at module scope by inference_mas.py for its model
+  # classes. Screening never instantiates a model, but the import must resolve.
+  "transformers==5.16.1",
+
+  # Used by answer_utils for date normalisation and math equivalence.
+  "python-dateutil==2.9.0.post0",
+  "sympy==1.14.0",
+
+  # answer_utils imports torch at module scope for format_latent_info, which
+  # screening never calls. The CPU build is sufficient — see [tool.uv] below for
+  # how that is enforced, and the note there for pip users on Linux.
+  "torch==2.13.0",
+]
+
+[project.scripts]
+screen = "screening.run_screen:main"
+screen-report = "screening.report:main"
+
+
+# Only screening/ ships. Without this, hatchling would try to infer packages and
+# could pick up the vendored checkout.
+[tool.hatch.build.targets.wheel]
+packages = ["screening"]
+
+
+[dependency-groups]
+dev = ["ruff==0.14.2"]
+
+
+# uv resolves torch from PyTorch's CPU index rather than PyPI, which is what the
+# screening step needs and roughly 200 MB rather than 2.5 GB.
+#
+# PIP USERS: this section is uv-only. pip has no per-package index, so on Linux
+# `pip install -e .` will pull the default CUDA-bearing wheel. Either use uv, or
+# install torch first and let the pin be satisfied:
+#
+#     pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cpu
+#     pip install -e .
+#
+# On macOS arm64 the PyPI wheel is already CPU-only, so this does not arise.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+
+[tool.ruff]
+line-length = 200
+target-version = "py314"
+
+# The vendored checkout is upstream code held at its published state. It is not
+# ours to reformat, and lint findings in it are noise.
+extend-exclude = ["RecursiveMAS", "benchmarks", ".venv"]
+
+[tool.ruff.lint]
+select = [
+  "E",   # pycodestyle errors — includes E402, which the noqa comments in
+         # datasets.py, prompts.py and score.py depend on being active
+  "F",   # pyflakes
+  "W",   # pycodestyle warnings
+  "I",   # import sorting
+  "UP",  # pyupgrade
+  "B",   # flake8-bugbear
+]
+
+# Three modules must call add_recursivemas_to_path() before importing anything
+# from the vendored harness, so their imports cannot be hoisted to the top of the
+# file. E402 is already silenced inline; I001 has to be silenced here, because
+# `ruff check --fix` would otherwise reorder those blocks and break the import.
+[tool.ruff.lint.per-file-ignores]
+"screening/datasets.py" = ["I001"]
+"screening/prompts.py" = ["I001"]
+"screening/score.py" = ["I001"]
+
+[tool.ruff.format]
+quote-style = "double"

@@ -1,0 +1,31 @@
+# Dependencies for Step 1 screening only. Verified on Python 3.14.6 (macOS arm64).
+#
+#   python3 -m venv .venv && source .venv/bin/activate
+#   pip install -r screening/requirements.txt
+#   pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cpu
+#
+# This is NOT RecursiveMAS/requirements.txt, which pins the versions needed to
+# train and run the latent pipeline on GPU. Screening only needs enough of that
+# stack to import the vendored dataset loaders and scorers.
+
+# OpenRouter client and configuration.
+httpx==0.28.1
+python-dotenv==1.2.3
+
+# Required by the vendored loaders in RecursiveMAS/inference/.
+datasets==5.0.1
+huggingface_hub==1.29.0
+tqdm==4.70.0
+
+# transformers is imported at module scope by inference_mas.py for its model
+# classes. Screening never instantiates a model, but the import must resolve.
+transformers==5.16.1
+
+# Used by answer_utils for date normalisation and math equivalence.
+python-dateutil==2.9.0.post0
+sympy==1.14.0
+
+# torch is installed separately from the CPU index (see the header). answer_utils
+# imports it at module scope for format_latent_info, which screening never calls,
+# so the ~200MB CPU build is sufficient and no GPU build is needed.
+# torch==2.13.0
