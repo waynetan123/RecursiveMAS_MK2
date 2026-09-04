@@ -38,6 +38,10 @@ from screening.score import BenchmarkScore, score_benchmark
 # Items generated and checked before the rest of a benchmark proceeds.
 THINKING_PROBE_SIZE = 20
 
+# How often a long cell reports progress. Without this a 300-generation cell
+# prints nothing for half an hour and is indistinguishable from a hang.
+PROGRESS_EVERY = 25
+
 # --canary limits: enough to exercise every path, cheap enough to run freely.
 # Two rollouts still exercise the pass@k aggregation; a 2,000-token cap keeps AIME
 # from dominating the bill and incidentally exercises the truncation column too.
@@ -78,35 +82,99 @@ async def _generate_one(
     )
 
 
-# Generate every item for one rollout, probing the thinking mode first.
-async def _generate_rollout(
+# Generate every (rollout, item) pair for one cell as a single concurrent pool.
+#
+# Flattened rather than one rollout at a time: a rollout only finishes when its
+# slowest generation does, so running 10 rollouts in sequence pays that straggler
+# wait 10 times and leaves most of the concurrency slots idle at each boundary.
+# AIME, the only benchmark with 10 rollouts, was where this hurt most.
+async def _generate_cell(
     client: OpenRouterClient,
     model: ModelSpec,
     records: list[EvalRecord],
     spec: BenchmarkSpec,
-    seed: int,
+    base_seed: int,
     thinking_key: str,
-    rollout_idx: int,
-    verify_thinking: bool,
-) -> list[Response]:
+) -> list[list[Response]]:
     thinking = THINKING_MODES[thinking_key]
 
-    async def generate(record: EvalRecord) -> Response:
+    async def generate(rollout_idx: int, record: EvalRecord) -> Response:
+        # Each rollout gets its own seed so pass@k samples differ from one another.
         return await _generate_one(
-            client, model, record, spec, seed, thinking, rollout_idx
+            client, model, record, spec, base_seed + rollout_idx, thinking, rollout_idx
         )
 
-    # Probe a small prefix first so a provider ignoring enabled=False is caught
-    # before the full benchmark is paid for.
-    if verify_thinking and thinking_key == "off":
-        probe = records[:THINKING_PROBE_SIZE]
-        probe_responses = await asyncio.gather(*(generate(r) for r in probe))
-        assert_thinking_disabled(list(probe_responses), spec.key)
+    # Probe a small prefix first, so a provider ignoring enabled=False is caught
+    # before the rest of the cell is paid for.
+    probe: list[Response] = []
+    if thinking_key == "off":
+        probe = list(
+            await asyncio.gather(*(generate(0, r) for r in records[:THINKING_PROBE_SIZE]))
+        )
+        assert_thinking_disabled(probe, spec.key)
 
-        remaining = await asyncio.gather(*(generate(r) for r in records[THINKING_PROBE_SIZE:]))
-        return list(probe_responses) + list(remaining)
+    # Everything not already covered by the probe, as one flat pool. Indices rather
+    # than records, so reassembly is positional and cannot mismatch.
+    jobs = [
+        (rollout_idx, item_idx)
+        for rollout_idx in range(spec.rollouts)
+        for item_idx in range(len(records))
+        if not (rollout_idx == 0 and item_idx < len(probe))
+    ]
 
-    return list(await asyncio.gather(*(generate(r) for r in records)))
+    results = await _gather_with_progress(
+        [generate(rollout_idx, records[item_idx]) for rollout_idx, item_idx in jobs],
+        label=f"{spec.key}/{model.key}/{thinking_key}",
+        already_done=len(probe),
+        total=len(records) * spec.rollouts,
+    )
+
+    # Reassemble into per-rollout lists in the original record order.
+    by_rollout: list[list[Response]] = [
+        [None] * len(records) for _ in range(spec.rollouts)  # type: ignore[list-item]
+    ]
+    for item_idx, response in enumerate(probe):
+        by_rollout[0][item_idx] = response
+    for (rollout_idx, item_idx), response in zip(jobs, results):
+        by_rollout[rollout_idx][item_idx] = response
+    return by_rollout
+
+
+# Await many generations, printing a progress line as they land.
+async def _gather_with_progress(
+    coroutines: list,
+    label: str,
+    already_done: int,
+    total: int,
+) -> list[Response]:
+    results: list[Response | None] = [None] * len(coroutines)
+    completed = already_done
+    started = time.monotonic()
+
+    # Each coroutine carries its own index, because asyncio.as_completed yields
+    # fresh awaitables rather than the futures handed to it — so the completed
+    # object cannot be used to look the position back up.
+    async def indexed(idx: int, coroutine):
+        return idx, await coroutine
+
+    tasks = [asyncio.ensure_future(indexed(i, c)) for i, c in enumerate(coroutines)]
+    for future in asyncio.as_completed(tasks):
+        idx, response = await future
+        results[idx] = response
+        completed += 1
+
+        # A long cell would otherwise print nothing at all and look frozen.
+        if completed % PROGRESS_EVERY == 0 or completed == total:
+            elapsed = time.monotonic() - started
+            rate = (completed - already_done) / elapsed if elapsed > 0 else 0.0
+            remaining = (total - completed) / rate if rate > 0 else 0.0
+            print(
+                f"       {label}: {completed}/{total} "
+                f"({rate * 60:.0f}/min, ~{remaining / 60:.0f} min left)",
+                flush=True,
+            )
+
+    return [r for r in results if r is not None]
 
 
 # Run one (benchmark, model, thinking mode) cell end to end.
@@ -124,20 +192,14 @@ async def run_cell(
         f"n={len(records)} rollouts={spec.rollouts}"
     )
 
-    # Each rollout gets its own seed so pass@k samples differ from one another.
-    responses_by_rollout = []
-    for rollout_idx in range(spec.rollouts):
-        responses = await _generate_rollout(
-            client=client,
-            model=model,
-            records=records,
-            spec=spec,
-            seed=config.seed + rollout_idx,
-            thinking_key=thinking_key,
-            rollout_idx=rollout_idx,
-            verify_thinking=(rollout_idx == 0),
-        )
-        responses_by_rollout.append(responses)
+    responses_by_rollout = await _generate_cell(
+        client=client,
+        model=model,
+        records=records,
+        spec=spec,
+        base_seed=config.seed,
+        thinking_key=thinking_key,
+    )
 
     client.assert_routing(model)
 
@@ -288,7 +350,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--num-samples", type=int, default=-1, help="Cap items per benchmark.")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--concurrency", type=int, default=8)
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=32,
+        help="Parallel in-flight requests. 8 measured ~10 gens/min; 32 is ~4x that.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print a cost estimate and exit.")
     parser.add_argument("--no-cache", action="store_true", help="Force regeneration.")
     parser.add_argument(

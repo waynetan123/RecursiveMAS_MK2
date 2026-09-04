@@ -168,7 +168,14 @@ class OpenRouterClient:
         last_error: Exception | None = None
         for attempt in range(MAX_RETRIES):
             try:
-                reply = await self._client.post(OPENROUTER_URL, json=payload, headers=headers)
+                # The semaphore is acquired per attempt, not around the whole retry
+                # loop. Holding it across retries would let one stalled request block
+                # a concurrency slot for up to MAX_RETRIES * REQUEST_TIMEOUT_S, which
+                # starves the pool and looks exactly like a hang.
+                async with self._semaphore:
+                    reply = await self._client.post(
+                        OPENROUTER_URL, json=payload, headers=headers
+                    )
 
                 # Non-retryable 4xx means the request itself is wrong: fail loud.
                 if reply.status_code not in RETRYABLE_STATUS and reply.status_code >= 400:
@@ -215,9 +222,8 @@ class OpenRouterClient:
                 "Run the generation sweep first."
             )
 
-        # Bound concurrency around the network call only, not the cache lookup.
-        async with self._semaphore:
-            body = await self._post_with_retries(payload)
+        # _post_with_retries takes the semaphore itself, per attempt.
+        body = await self._post_with_retries(payload)
 
         choice = (body.get("choices") or [{}])[0]
         message = choice.get("message") or {}
