@@ -10,6 +10,11 @@ paper's table. Adds two diagnostics the harness does not report:
   not a measurement, so it is tracked separately.
 - Truncation rate. A high rate means the token cap bound the score, not the
   model, so the number is a floor and is never grounds to retire a benchmark.
+- Failure rate. The union of the two above with provider errors: every generation
+  that could not yield a scoreable answer. Each of those is scored wrong when it
+  might have been right, so score + failure_rate is the highest score the cell
+  could have reached, which is what lets report.py decide a benchmark whose
+  diagnostics are dirty but whose ceiling still sits below the gate.
 """
 
 from __future__ import annotations
@@ -71,6 +76,7 @@ class BenchmarkScore:
     parse_failure_rate: float
     truncation_rate: float
     error_rate: float
+    failure_rate: float  # union of the three above, per generation
     wilson_low: float
     wilson_high: float
     items: list[ItemResult] = field(default_factory=list)
@@ -235,6 +241,13 @@ def score_benchmark(
         parse_failure_rate=sum(1 for i in all_items if not i.parse_ok) / total_generations,
         truncation_rate=sum(1 for i in all_items if i.truncated) / total_generations,
         error_rate=sum(1 for i in all_items if i.api_error) / total_generations,
+        # The union, not the sum: the three failure modes overlap heavily, since a
+        # truncated response usually also fails to parse. Summing them would
+        # double-count and overstate how much headroom is unaccounted for.
+        failure_rate=sum(
+            1 for i in all_items if i.truncated or not i.parse_ok or i.api_error
+        )
+        / total_generations,
         wilson_low=wilson_low,
         wilson_high=wilson_high,
         items=all_items,
