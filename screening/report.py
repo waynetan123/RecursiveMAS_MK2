@@ -32,6 +32,7 @@ from screening.config import (
     MODELS,
     OUT_OF_SCOPE_BENCHMARKS,
     SATURATION_THRESHOLD,
+    THINKING_MODE_CAVEATS,
     BENCHMARKS_DIR,
     DEFAULT_SEED,
 )
@@ -56,6 +57,7 @@ class BenchmarkVerdict:
     parse_failure_rate: float
     truncation_rate: float
     error_rate: float
+    failure_rate: float
     metric_name: str
     n: int
     decision: str
@@ -98,14 +100,25 @@ def build_verdict(benchmark: str, rows: list[dict]) -> BenchmarkVerdict:
         (r for r in rows if r["thinking"] == "off" and r["model"] == best_off_model), rows[0]
     )
 
-    # Diagnostics must come from the thinking-OFF cells only, because those are the
-    # cells the gate reads. Taking the max across both modes would let a thinking-ON
-    # run — where reasoning tokens routinely exhaust the cap — invalidate a
-    # thinking-OFF decision that was never truncated at all.
-    off_rows = [r for r in rows if r["thinking"] == "off"] or rows
-    parse_failure_rate = max(r["parse_failure_rate"] for r in off_rows)
-    truncation_rate = max(r["truncation_rate"] for r in off_rows)
-    error_rate = max(r.get("error_rate", 0.0) for r in off_rows)
+    # A diagnostic describes one (benchmark, model) cell, not the benchmark, so it
+    # must be read from the single cell the gate actually scores. Taking the worst
+    # across cells charges the weaker backbone's failures against the stronger
+    # backbone's number — Qwen truncating 65% of HLE says nothing about whether
+    # Gemma's clean 11.1% is saturated — and blocked four verdicts on that basis.
+    # Restricting to thinking-OFF was necessary but not sufficient: the gating cell
+    # is one model in one mode, not both models in one mode.
+    parse_failure_rate = gating_row["parse_failure_rate"]
+    truncation_rate = gating_row["truncation_rate"]
+    error_rate = gating_row.get("error_rate", 0.0)
+
+    # Union of every way a generation can fail to produce a scoreable answer.
+    # Summaries written before this field existed fall back to the sum, which
+    # double-counts the overlap and so overstates the ceiling. That errs in the
+    # only safe direction: an inflated ceiling can withhold a RETAIN, never grant
+    # a wrong one.
+    failure_rate = gating_row.get(
+        "failure_rate", parse_failure_rate + truncation_rate + error_rate
+    )
 
     decision, reason = _decide(
         scorer=BENCHMARKS[benchmark].scorer,
@@ -116,6 +129,7 @@ def build_verdict(benchmark: str, rows: list[dict]) -> BenchmarkVerdict:
         parse_failure_rate=parse_failure_rate,
         truncation_rate=truncation_rate,
         error_rate=error_rate,
+        failure_rate=failure_rate,
     )
 
     return BenchmarkVerdict(
@@ -130,6 +144,7 @@ def build_verdict(benchmark: str, rows: list[dict]) -> BenchmarkVerdict:
         parse_failure_rate=parse_failure_rate,
         truncation_rate=truncation_rate,
         error_rate=error_rate,
+        failure_rate=failure_rate,
         metric_name=gating_row["metric_name"],
         n=gating_row["n"],
         decision=decision,
@@ -171,7 +186,25 @@ def _decide(
     parse_failure_rate: float,
     truncation_rate: float,
     error_rate: float,
+    failure_rate: float,
 ) -> tuple[str, str]:
+    # Every failure mode guarded below — truncation, unparseable output, provider
+    # error — scores a generation wrong that might have been right, so each one
+    # biases the observed score downward and never upward. The most the cell could
+    # have scored is therefore score + failure_rate. When even that ceiling sits
+    # below the threshold, and sampling error cannot carry it there either, no
+    # re-run can make the benchmark saturated and the guards have nothing left to
+    # protect. Checked first, because it resolves cases they would only block.
+    ceiling = best_off + 100.0 * failure_rate
+    if ceiling < SATURATION_THRESHOLD and wilson_high < SATURATION_THRESHOLD:
+        return RETAIN, (
+            f"Headroom {100.0 - best_off:.1f} points above the strongest single backbone "
+            f"(95% CI [{wilson_low:.1f}, {wilson_high:.1f}], n={n}). "
+            f"{100.0 * failure_rate:.1f}% of generations yielded no scoreable answer, but "
+            f"crediting every one of them as correct reaches only {ceiling:.1f}, so the "
+            "benchmark cannot be saturated and those failures do not block the decision."
+        )
+
     # Provider failures are not model failures. Empty responses scored as wrong
     # depress the score and would make a saturated benchmark look retainable.
     if error_rate > MAX_TRUSTED_ERROR_RATE:
@@ -295,6 +328,13 @@ def write_headroom(verdicts: list[BenchmarkVerdict], path: Path) -> None:
             + ". Not locked; see exclusions.md for what each needs."
         )
 
+    # Carried into the write-up's methods section alongside the table, because a
+    # reader who takes a column at face value would otherwise misread it.
+    if THINKING_MODE_CAVEATS:
+        lines += ["", "## Caveats on how these columns read", ""]
+        for cell, note in sorted(THINKING_MODE_CAVEATS.items()):
+            lines += [f"**`{cell}`.** {note}", ""]
+
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -389,6 +429,9 @@ def write_manifest(summaries: list[dict], results_path: Path, path: Path) -> Non
         },
         "cells_completed": len(summaries),
         "realised_cost_usd": round(cost, 4),
+        # Conditions under which a column may not mean what its label says. Kept in
+        # the manifest so a score quoted from it carries its own qualification.
+        "thinking_mode_caveats": THINKING_MODE_CAVEATS,
     }
     path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 

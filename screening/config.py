@@ -102,6 +102,28 @@ THINKING_MODES: dict[str, dict[str, Any]] = {
     "on": {"enabled": True, "effort": "high"},
 }
 
+# Qualifications on how a cell's numbers may be read, keyed by "<model>/<mode>".
+# Written into manifest.json and headroom.md so a quoted score cannot be lifted
+# out of the record without the caveat that applies to it.
+THINKING_MODE_CAVEATS: dict[str, str] = {
+    "qwen/off": (
+        "Not a true no-reasoning baseline. reasoning.enabled=false does suppress the "
+        "labelled thinking channel, and all three probe signals agree it is absent: no "
+        "thinking tag appears in any of the 11,718 recorded responses, no message.reasoning "
+        "field is populated, and no reasoning tokens are billed beyond a single outlier in "
+        "hle. The deliberation is nonetheless still performed — it has moved into the "
+        "visible answer as ordinary prose. Qwen emits 1.8-3.4x Gemma's output length, and "
+        "self-correction discourse markers appear in 68.7% of gpqa, 76.7% of lcb and 84.4% "
+        "of hle responses, against 18-41% for Gemma on the same items. The thinking-OFF arm "
+        "therefore compares Gemma answering directly against Qwen reasoning unlabelled, and "
+        "the two columns are not the same experimental condition. This is recorded rather "
+        "than corrected: suppressing the working would require a prompt change, and the "
+        "prompt is held verbatim from the harness so that scores stay on the published "
+        "table's scale. It does not affect any gate decision, because Qwen scores below "
+        "Gemma on all eight benchmarks and so sets no gating score."
+    ),
+}
+
 
 # One benchmark: where to load it, how to generate for it, and how to score it.
 @dataclass(frozen=True)
