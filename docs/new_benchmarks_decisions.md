@@ -320,9 +320,12 @@ check. Step 2 reproduces a configuration known to work, so if the probe detects 
 
 ## 6. Step 0 — code changes, before any spending
 
+**Status: implemented 2026-09-05.** This section is now the record of what was changed
+and why; §7.1 states what to verify before spending.
+
 The response cache is keyed on `sha256(canonical_payload + rollout_idx)`, so **any**
-parameter change invalidates every affected entry. All of the following must land before
-the first API call, or they will be paid for twice.
+parameter change invalidates every affected entry. Every change below therefore had to
+land before the first API call, or it would have been paid for twice.
 
 ### 6.1 Changes
 
@@ -349,6 +352,23 @@ be chosen to maximise n subject to headroom staying above roughly 25 points.
 Ordering is deliberate: everything that can invalidate the cache happens first, and the
 single most decision-relevant cell runs before the bulk of the spend.
 
+### 7.1 The sequence at a glance
+
+| step | Brief description of task | Reasoning for doing said step | Golden output |
+|---|---|---|---|
+| **0** | **Code changes** — widened choice extractor (`choice_letters`), `OMNI_MATH_REPO` -> `martheballon/Omni-MATH-2`, Medbullets op4+op5 loaders, `omni_math` cap 8k->16k, `--rollouts` CLI flag, `aggregation` (pass@k vs mean), `is_control`, `min_difficulty` | The cache is keyed on `sha256(payload + rollout_idx)`, so **any** parameter change invalidates entries and the work is paid for twice. The extractor is the hard blocker: `[A-Da-d]` silently scores MedXpertQA (A-J) and op5 (E) as "A" and marks them **correct** whenever A is the gold — and the parse-failure diagnostic will not catch it, because the answer did parse | **Implemented 2026-09-05.** Verify: `omni_math` at `max_tokens=16000, rollouts=5, aggregation=MEAN, min_difficulty=0.0`; `medxpertqa` at `choice_letters="ABCDEFGHIJ"`; `medbullets_op5` at `"ABCDE"`; three specs carrying `is_control=True`; `report.py` excluding controls from the tally |
+| **1** | **Canary the four new benchmarks** — `--benchmark omni_math,medxpertqa,beyondaime,medbullets_op4,medbullets_op5 --canary` (~$1) | Exercises every new path — the repaired Omni-MATH repo, the widened extractor, both Medbullets loaders, the MedXpertQA choice marker — for under a dollar, before committing ~$150 | All five cells complete. Thinking probe passes on every OFF cell. **No "E" or A-J answer lands on "A"** — the extractor fix is the thing being tested. Summaries carry `is_canary=True`, so no 10-item score can later be mistaken for a measurement |
+| **2** | **The gating cell alone**: `--benchmark omni_math --model gemma --thinking off --rollouts 1`, full 4,172 items (~$35) | Of four cells per benchmark, exactly one decides the verdict — `report.py:build_verdict` selects *thinking-OFF, strongest model* (Gemma in 8 of 8 so far). Two payoffs: **early exit** if it saturates, and it is the only way to set `min_difficulty` from evidence rather than a guess | A Gemma OFF score with a ~±1.5 interval, plus per-item difficulty **and** correctness. **Expect 55-75.** A score >= 90 retires it, falling back to the pooled competition set. Otherwise read the score-versus-difficulty curve and set `min_difficulty` to maximise n while holding ~25 points of headroom |
+| **3** | **Remaining OFF cells** at `--rollouts 1`: `omni_math` x3 (on the chosen subset), `medxpertqa` x2, `beyondaime` x2, `medbullets_op4/op5` x4 (~$60) | Completes the gate evidence for the two new gated benchmarks and establishes baselines for both controls. Filtering `omni_math` post hoc is free — those 4,172 responses are already cached, so only the subset is generated for the other three cells, roughly 6,500 generations never paid for | MedXpertQA Gemma OFF **~30** (Medmarks puts large models at 0.29). BeyondAIME clearly unsaturated, or it is useless as a control. **Critical:** the op4->op5 drop. **>= 5 points means the Critic probe has range; < 2 points means it has none — drop it and record the limitation** |
+| **4** | **Qwen OFF re-runs at a raised cap**: `gpqa`, `lcb`, `hle` (~$25) | Qwen truncated **34% / 31% / 65%** of these — all three are *retained* benchmarks, so all three Qwen numbers are floors rather than measurements. **Arm B's Solver backbone has no usable baseline anywhere.** The cause is on record: `reasoning.enabled=false` moves Qwen's deliberation into the visible answer, so it emits 1.8-3.4x Gemma's tokens and exhausts the cap | Truncation below `MAX_TRUSTED_TRUNCATION_RATE` (10%) on all three, and Qwen scores that are measurements rather than lower bounds. Gemma is expected to remain the gating model — this is what proves it rather than assuming it |
+| **5** | **Free housekeeping**: `--benchmark hle --rescore-only` under a second-family judge, then `python -m screening.report` | Re-judging costs nothing (`require_cache=True` makes a miss an error, never an API call) and fixes the Qwen-judges-Qwen family collision. The audit showed judge choice alone worth **5.5 points**, eleven times the effect size this project measures | A recorded judge delta in `manifest.json`; a delta above ~0.5 points is a measurement problem to resolve before Step 8. `report.py` shows **`Retained:` >= 4 excluding controls**, at least 2 anchors, and controls in their own section with headroom but no verdict |
+| **6** | **Thinking-ON, survivors only, last** (~$55) | Gates nothing — §2.3 keeps it purely as write-up context. Skip `math500`, `aime25`, `aime26` and `medqa`: they are retired on the OFF column, and since thinking only raises scores, an ON cell can confirm a retirement but never overturn it. First item to cut if the budget tightens | A populated `max ON` column on the retained set only, where every row currently reads `nan`. **No verdict changes** — if one moves, the OFF arm is at fault and must be investigated before the list is locked |
+
+**Steps 1-5 decide the benchmark list (~$150); Step 6 serves the write-up (~$55).** If a
+descope is forced, Step 6 goes first and Step 4 goes last — Arm B has no baseline without it.
+
+### 7.2 Flow
+
 ```mermaid
 flowchart TD
     S0["<b>Step 0</b> — code changes<br/><i>extractor, repo, op5, cap, flags</i>"]
@@ -373,7 +393,9 @@ flowchart TD
     style S6 fill:#5f370e,stroke:#b7791f,color:#feebc8
 ```
 
-### Step 1 — canary the four new benchmarks (~$1)
+### 7.3 Step detail
+
+#### Step 1 — canary the four new benchmarks (~$1)
 
 ```bash
 python -m screening.run_screen \
@@ -383,7 +405,7 @@ python -m screening.run_screen \
 Exercises the widened extractor, the new Omni-MATH repo and the op5 loader for under a
 dollar. Do not skip it; this is what the canary exists for.
 
-### Step 2 — the gating cell, first (~$35)
+#### Step 2 — the gating cell, first (~$35)
 
 ```bash
 python -m screening.run_screen \
@@ -411,7 +433,7 @@ gating model in 8 of 8 benchmarks so far.
    `--rescore-only` re-scores a subset at no cost. The remaining three cells then run on
    the subset instead of the full set — roughly 6,500 generations never paid for.
 
-### Step 3 — remaining OFF cells (~$60)
+#### Step 3 — remaining OFF cells (~$60)
 
 All at `--rollouts 1`, thinking off, both models:
 
@@ -420,7 +442,7 @@ All at `--rollouts 1`, thinking off, both models:
 - `beyondaime` — 2 cells
 - `medbullets` op4 **and** op5 — 4 cells
 
-### Step 4 — Qwen OFF re-runs at a raised cap (~$25)
+#### Step 4 — Qwen OFF re-runs at a raised cap (~$25)
 
 `gpqa`, `lcb`, `hle`. Qwen truncated **34%**, **31%** and **65%** of these respectively,
 so all three scores are floors rather than measurements — and all three benchmarks are
@@ -431,7 +453,7 @@ Root cause is recorded in `manifest.json`: `reasoning.enabled=false` suppresses 
 labelled thinking channel, but the deliberation moves into the visible answer as prose,
 so Qwen emits 1.8–3.4× Gemma's output and exhausts the cap.
 
-### Step 5 — free housekeeping
+#### Step 5 — free housekeeping
 
 ```bash
 python -m screening.run_screen --benchmark hle --rescore-only   # second-family judge
@@ -441,7 +463,7 @@ python -m screening.report                                       # re-lock the l
 Verify that `**Retained:**` clears `MIN_SURVIVING_BENCHMARKS`, that the controls are
 excluded from the tally, and that at least two anchors survive.
 
-### Step 6 — thinking-ON, survivors only, last (~$55)
+#### Step 6 — thinking-ON, survivors only, last (~$55)
 
 Not "all benchmarks", and not a re-run — these cells have never executed, so nothing is
 cached and the cost is full. Skip `math500`, `aime25`, `aime26` and `medqa`: they are
