@@ -38,6 +38,15 @@ SATURATION_THRESHOLD = 90.0
 # Minimum benchmarks that must survive screening, or Step 1's stop rule fires.
 MIN_SURVIVING_BENCHMARKS = 4
 
+# --canary limits: enough to exercise every path, cheap enough to run freely.
+# Two rollouts still exercise the multi-rollout aggregation; a 2,000-token cap keeps
+# the 16k benchmarks from dominating the bill and incidentally exercises the
+# truncation column too. Read by report.py as well, to recognise a canary summary
+# written before the flag existed.
+CANARY_SAMPLES = 10
+CANARY_ROLLOUTS = 2
+CANARY_MAX_TOKENS = 2000
+
 # Parse-failure rate above which a choice benchmark's accuracy is not trustworthy,
 # because answer_utils scores unparseable predictions as "A" rather than as wrong.
 MAX_TRUSTED_PARSE_FAILURE_RATE = 0.05
@@ -125,6 +134,16 @@ THINKING_MODE_CAVEATS: dict[str, str] = {
 }
 
 
+# How a multi-rollout benchmark's generations become one score. pass@k counts an
+# item correct if any rollout solved it, which is the paper's protocol; avg@k takes
+# the mean of independent attempts. The difference is not cosmetic: at a true
+# per-attempt skill of 30%, pass@10 reports 97.2. That is what saturated aime25 and
+# aime26 at the item level while their problems still had headroom, so any benchmark
+# whose headroom carries a decision is aggregated as a mean.
+AGGREGATION_PASS_AT_K = "pass_at_k"
+AGGREGATION_MEAN = "mean"
+
+
 # One benchmark: where to load it, how to generate for it, and how to score it.
 @dataclass(frozen=True)
 class BenchmarkSpec:
@@ -134,12 +153,28 @@ class BenchmarkSpec:
     scorer: str  # choice | math | code | judge
     max_tokens: int
     temperature: float = 0.6
-    rollouts: int = 1  # >1 reports pass@k instead of accuracy
+    rollouts: int = 1  # >1 reports pass@k or avg@k, per `aggregation`
+    aggregation: str = AGGREGATION_PASS_AT_K  # only read when rollouts > 1
     num_samples: int = -1  # -1 loads the full set
     full_set_size: int = 0  # documented size, used only for the --dry-run estimate
     shuffle: bool = False  # the harness defaults to False; only true where we subsample
     is_paper_benchmark: bool = True  # False for replacement candidates
     code_timeout_s: int = 10
+    # Option range this benchmark's answers use. The vendored extractor hardcodes
+    # A-D, which silently mis-scores anything wider; screening/score.py reads this
+    # instead. See MedXpertQA (A-J) and Medbullets op5 (A-E).
+    choice_letters: str = "ABCD"
+    # Item difficulty floor, for benchmarks that ship a difficulty label. 0.0 keeps
+    # every item, which is what a first pass must do: the cut is chosen from the
+    # observed score-versus-difficulty curve, not guessed before the curve exists.
+    min_difficulty: float = 0.0
+    # Controls are instrument checks, not gated benchmarks. They report headroom so
+    # a saturated control is visible, but produce no retain/retire verdict and are
+    # excluded from the surviving-benchmark tally the stop rule reads.
+    is_control: bool = False
+    # Set only by --canary. Recorded on every summary the canary writes so a
+    # 10-item smoke-test score can never be mistaken for a measurement.
+    is_canary: bool = False
     notes: str = ""
 
 
@@ -233,6 +268,132 @@ BENCHMARKS: dict[str, BenchmarkSpec] = {
             "Gated dataset — accept the terms at huggingface.co/datasets/cais/hle. "
             "Text-only subset; multimodal items dropped because Step 3 disables the "
             "vision path. Carries a canary string and must not reach training corpora."
+        ),
+    ),
+    # Restores mathematics, which retiring math500, aime25 and aime26 emptied.
+    # The repaired 2026 edition, never the 2024 original: an audit of that release
+    # found 647 problems needing edits and 247 that exact-answer verification cannot
+    # score at all — 61 of them referencing images Step 3's disabled vision path
+    # could never see.
+    "omni_math": BenchmarkSpec(
+        key="omni_math",
+        # The Filtered subset — every item the audit tagged non-standard removed —
+        # less the two that survive the tags with no reference answer at all.
+        full_set_size=4172,
+        loader_arg="omni_math",
+        split="train",
+        scorer="judge",
+        # Raised from 8,000: Qwen averaged 13,511 completion tokens on these problems
+        # in the canary, so the old cap turned most of its cell into truncations.
+        max_tokens=16000,
+        rollouts=5,
+        aggregation=AGGREGATION_MEAN,
+        is_paper_benchmark=False,
+        notes=(
+            "Omni-MATH-2-Filtered (martheballon/Omni-MATH-2, non-standard tags removed). "
+            "Scored by the judge pinned in this file and NEVER by Omni-Judge, which the "
+            "same audit found wrong in 96.4% of judge disagreements, its dominant failure "
+            "being exactly the equivalence-checking it exists to perform; re-scoring "
+            "identical generations moved one frontier model 5.5 points. This project "
+            "measures effects of about half a point, so (dataset, judge) is one frozen "
+            "unit. avg@k, never pass@k: pass@10 at a true per-attempt skill of 30% reports "
+            "97.2, which is how aime25 and aime26 saturated while their problems had not. "
+            "Screening runs at --rollouts 1, where the metric is plain accuracy and the "
+            "trap cannot reappear by accident. No difficulty cut is set in advance: "
+            "min_difficulty stays 0.0 until the gating cell's score-versus-difficulty "
+            "curve says where the cut maximises n while leaving 25 points of headroom."
+        ),
+    ),
+    # Replaces medqa, which screened at 92.3 with only 23 of 300 items unsolved.
+    # Hardest of the 19 verifiable medical benchmarks in Medmarks: 0.236 mean across
+    # 61 models against medqa's 0.784. MIT-licensed and ungated.
+    "medxpertqa": BenchmarkSpec(
+        key="medxpertqa",
+        full_set_size=2450,
+        loader_arg="medxpertqa",
+        split="test",
+        scorer="choice",
+        # 8,000 rather than medqa's 4,000. Qwen truncated 34% of gpqa at 4,000 and
+        # these items are harder, so the old cap would produce a floor, not a score.
+        max_tokens=8000,
+        # Ten options, A-J. The vendored extractor stops at D and defaults the rest
+        # to "A", which scores them correct whenever A is the gold.
+        choice_letters="ABCDEFGHIJ",
+        is_paper_benchmark=False,
+        notes=(
+            "Text split only; the MM split is multimodal and Step 3 disables the vision "
+            "path. Golds are uniform over all ten letters (222-263 each), so no option "
+            "shuffle is needed and none is applied."
+        ),
+    ),
+    # CONTROL. Contamination and judge-independence check for omni_math (§5.1).
+    "beyondaime": BenchmarkSpec(
+        key="beyondaime",
+        full_set_size=100,
+        loader_arg="beyondaime",
+        split="test",
+        scorer="math",
+        max_tokens=16000,
+        is_paper_benchmark=False,
+        is_control=True,
+        notes=(
+            "Not gated: n=100 gives +/-9.8, which compares signs and rough magnitudes and "
+            "nothing finer. Three jobs. (1) Contamination: Omni-MATH's problems went "
+            "public in October 2024 and both backbones postdate that, so a gain there "
+            "could be retrieval; BeyondAIME is the clean twin, same domain and answer "
+            "format and difficulty band, every problem manually rewritten. (2) Judge "
+            "independence: positive-integer answers go through compare_answers with no "
+            "judge in the loop, the only maths benchmark in the set with that property. "
+            "(3) Threshold calibration for omni_math's difficulty cut, whose labels are "
+            "self-reported where BeyondAIME's band is externally anchored. CC0."
+        ),
+    ),
+    # CONTROL. Critic mechanism probe, first half of the pair (§5.2).
+    "medbullets_op4": BenchmarkSpec(
+        key="medbullets_op4",
+        full_set_size=308,
+        loader_arg="medbullets_op4",
+        split="train",
+        scorer="choice",
+        max_tokens=4000,
+        is_paper_benchmark=False,
+        is_control=True,
+        notes=(
+            "Not gated: Gemma's canary already scored 90.0, the same neighbourhood as the "
+            "medqa it would replace, and the questions come from a public X account posting "
+            "between April 2022 and December 2023 and so are heavily exposed to pretraining. "
+            "It earns its place as the baseline arm of a paired probe, where both objections "
+            "cancel: a memorised question is memorised in op4 and op5 alike and contributes "
+            "nothing to the difference between them. Options are re-shuffled by stable hash "
+            "because the shipped gold distribution is skewed (A 87, D 68 of 308), and a "
+            "position effect must not be readable as distractor sensitivity."
+        ),
+    ),
+    # CONTROL. Critic mechanism probe, second half of the pair (§5.2).
+    "medbullets_op5": BenchmarkSpec(
+        key="medbullets_op5",
+        full_set_size=308,
+        loader_arg="medbullets_op5",
+        split="train",
+        scorer="choice",
+        max_tokens=4000,
+        # A-E: op5 is op4 plus one extra plausible-but-wrong option.
+        choice_letters="ABCDE",
+        is_paper_benchmark=False,
+        is_control=True,
+        notes=(
+            "The same 308 questions as medbullets_op4 with one extra distractor and nothing "
+            "else changed, so the op4->op5 drop isolates one variable: what an additional "
+            "attractive wrong option costs. Rejecting one is the Critic's job, giving a "
+            "falsifiable prediction independent of headline accuracy — RecursiveMAS's drop "
+            "should be smaller than the single-agent baseline's, and should shrink "
+            "monotonically across depths 1-2-3. The comparison is within one scale across "
+            "Step 8 rows, never 4B against 31B, since larger models are less distractible "
+            "regardless. Paired on identical items, so item difficulty cancels and the "
+            "+/-4.3 marginal interval does not apply; simulated power at 308 items and five "
+            "runs detects a 3-point change 98% of the time and a 2-point change 68%. "
+            "Screening it now asks only whether the instrument has any range: a baseline "
+            "drop under ~2 points means there is none and the probe should be dropped."
         ),
     ),
 }

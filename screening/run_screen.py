@@ -8,6 +8,8 @@ iterate on. `--rescore-only` re-scores cached responses without spending anythin
 
     python -m screening.run_screen --canary
     python -m screening.run_screen --benchmark gpqa --model qwen --thinking off
+    python -m screening.run_screen --benchmark omni_math,medxpertqa --canary
+    python -m screening.run_screen --benchmark omni_math --model gemma --thinking off --rollouts 1
     python -m screening.run_screen --all
     python -m screening.run_screen --all --rescore-only
 """
@@ -17,12 +19,16 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import time
 from dataclasses import asdict, replace
 from pathlib import Path
 
 from screening.config import (
     BENCHMARKS,
+    CANARY_MAX_TOKENS,
+    CANARY_ROLLOUTS,
+    CANARY_SAMPLES,
     MODELS,
     THINKING_MODES,
     BenchmarkSpec,
@@ -41,13 +47,6 @@ THINKING_PROBE_SIZE = 20
 # How often a long cell reports progress. Without this a 300-generation cell
 # prints nothing for half an hour and is indistinguishable from a hang.
 PROGRESS_EVERY = 25
-
-# --canary limits: enough to exercise every path, cheap enough to run freely.
-# Two rollouts still exercise the pass@k aggregation; a 2,000-token cap keeps AIME
-# from dominating the bill and incidentally exercises the truncation column too.
-CANARY_SAMPLES = 10
-CANARY_ROLLOUTS = 2
-CANARY_MAX_TOKENS = 2000
 
 # Rough average output tokens per item, for the --dry-run estimate only.
 DRY_RUN_OUTPUT_FRACTION = {"off": 0.35, "on": 0.85}
@@ -188,7 +187,7 @@ async def run_cell(
 ) -> BenchmarkScore:
     dataset_name, records = load_benchmark(spec, config, num_samples_override=num_samples)
     print(
-        f"[run] {spec.key:<10} model={model.key:<6} thinking={thinking_key:<3} "
+        f"[run] {spec.key:<15} model={model.key:<6} thinking={thinking_key:<3} "
         f"n={len(records)} rollouts={spec.rollouts}"
     )
 
@@ -261,6 +260,7 @@ def _write_results(
         summary.pop("items", None)
         summary["type"] = "summary"
         summary["timestamp"] = time.time()
+        summary["canary"] = spec.is_canary
         handle.write(json.dumps(summary, ensure_ascii=False) + "\n")
 
 
@@ -278,7 +278,7 @@ def _effective_n(spec: BenchmarkSpec, num_samples: int) -> int:
 def _dry_run(cells: list[tuple[BenchmarkSpec, ModelSpec, str]], num_samples: int) -> None:
     generation_total = 0.0
     judge_total = 0.0
-    print(f"{'benchmark':<11}{'model':<8}{'think':<7}{'gens':>8}{'gen $':>9}{'judge $':>9}")
+    print(f"{'benchmark':<15}{'model':<8}{'think':<7}{'gens':>8}{'gen $':>9}{'judge $':>9}")
 
     for spec, model, thinking_key in cells:
         generations = _effective_n(spec, num_samples) * spec.rollouts
@@ -301,7 +301,7 @@ def _dry_run(cells: list[tuple[BenchmarkSpec, ModelSpec, str]], num_samples: int
         generation_total += generation_cost
         judge_total += judge_cost
         print(
-            f"{spec.key:<11}{model.key:<8}{thinking_key:<7}{generations:>8}"
+            f"{spec.key:<15}{model.key:<8}{thinking_key:<7}{generations:>8}"
             f"{generation_cost:>9.2f}{judge_cost:>9.2f}"
         )
 
@@ -319,15 +319,40 @@ def _to_canary(spec: BenchmarkSpec) -> BenchmarkSpec:
         spec,
         rollouts=min(spec.rollouts, CANARY_ROLLOUTS),
         max_tokens=min(spec.max_tokens, CANARY_MAX_TOKENS),
+        # Marked so report.py can tell a 10-item smoke test from a measurement.
+        # Without this the canary's summary is the newest row for its cell and the
+        # gate reads it as the benchmark's score.
+        is_canary=True,
     )
+
+
+# Accept both "--benchmark a b" and the comma-separated "--benchmark a,b".
+def _parse_benchmark_names(values: list[str] | None) -> list[str]:
+    if not values:
+        return []
+
+    names = [name for value in values for name in value.split(",") if name.strip()]
+    unknown = [name for name in names if name not in BENCHMARKS]
+    if unknown:
+        raise SystemExit(
+            f"Unknown benchmark(s): {', '.join(unknown)}. "
+            f"Choose from: {', '.join(sorted(BENCHMARKS))}"
+        )
+    return names
 
 
 # Expand the CLI selection into the list of cells to run.
 def _select_cells(args: argparse.Namespace) -> list[tuple[BenchmarkSpec, ModelSpec, str]]:
-    benchmarks = list(BENCHMARKS.values()) if not args.benchmark else [BENCHMARKS[args.benchmark]]
+    names = _parse_benchmark_names(args.benchmark)
+    benchmarks = [BENCHMARKS[key] for key in names] if names else list(BENCHMARKS.values())
     models = list(MODELS.values()) if not args.model else [MODELS[args.model]]
     thinking_modes = list(THINKING_MODES) if not args.thinking else [args.thinking]
 
+    # Overrides are applied before --canary so the canary's own caps still win.
+    if args.rollouts > 0:
+        benchmarks = [replace(spec, rollouts=args.rollouts) for spec in benchmarks]
+    if args.min_difficulty > 0.0:
+        benchmarks = [replace(spec, min_difficulty=args.min_difficulty) for spec in benchmarks]
     if args.canary:
         benchmarks = [_to_canary(spec) for spec in benchmarks]
 
@@ -336,7 +361,17 @@ def _select_cells(args: argparse.Namespace) -> list[tuple[BenchmarkSpec, ModelSp
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="RecursiveMAS MK2 Step 1 benchmark screening.")
-    parser.add_argument("--benchmark", choices=sorted(BENCHMARKS), help="Default: all.")
+    # nargs="+" so a partial re-screen (a couple of replacement benchmarks, say) is
+    # one command and one results file, rather than one invocation per benchmark.
+    parser.add_argument(
+        "--benchmark",
+        nargs="+",
+        metavar="NAME",
+        help=(
+            f"One or more, space- or comma-separated: {', '.join(sorted(BENCHMARKS))}. "
+            "Default: all."
+        ),
+    )
     parser.add_argument("--model", choices=sorted(MODELS), help="Default: all.")
     parser.add_argument("--thinking", choices=sorted(THINKING_MODES), help="Default: both.")
     parser.add_argument("--all", action="store_true", help="Run the full sweep.")
@@ -349,6 +384,30 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--num-samples", type=int, default=-1, help="Cap items per benchmark.")
+    # A CLI override, deliberately not an edit to BenchmarkSpec.rollouts: the spec
+    # records what Step 8 will run, and editing it to 1 for a screen would carry
+    # rollouts=1 silently into the evaluation that needs the variance estimate.
+    parser.add_argument(
+        "--rollouts",
+        type=int,
+        default=-1,
+        help="Override every selected benchmark's rollout count. Screening uses 1.",
+    )
+    # Free to apply after the fact: the difficulty cut changes which cached
+    # generations are scored, not which ones are requested.
+    parser.add_argument(
+        "--min-difficulty",
+        type=float,
+        default=0.0,
+        help="Keep only items at or above this difficulty (omni_math). Default: no cut.",
+    )
+    # (dataset, judge) is one frozen unit, so scoring the same generations under a
+    # second judge and recording the delta is part of the protocol, not an option.
+    parser.add_argument(
+        "--judge-model",
+        default="",
+        help="Override the LLM judge for this run, e.g. to measure the judge's own delta.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--concurrency",
@@ -373,6 +432,11 @@ async def main_async(args: argparse.Namespace) -> int:
     if args.dry_run:
         _dry_run(cells, num_samples)
         return 0
+
+    # llm_judge reads API_MODEL from the environment at call time, and load_config
+    # only setdefaults it, so an explicit value set here wins.
+    if args.judge_model:
+        os.environ["API_MODEL"] = args.judge_model
 
     config = load_config(seed=args.seed)
 

@@ -22,6 +22,7 @@ from pathlib import Path
 
 from screening.config import (
     BENCHMARKS,
+    CANARY_SAMPLES,
     INFEASIBLE_CANDIDATES,
     MAX_TRUSTED_ERROR_RATE,
     MAX_TRUSTED_PARSE_FAILURE_RATE,
@@ -41,6 +42,21 @@ from screening.config import (
 RETAIN = "RETAIN"
 RETIRE = "RETIRE"
 UNDECIDED = "UNDECIDED"
+
+# How a control's gate reading is rendered. A control is not gated — it produces no
+# retain/retire verdict and is not counted toward the stop rule — but it still needs
+# a headroom row, because a saturated control is an unusable control.
+CONTROL_LABEL = {
+    RETAIN: "CONTROL (has range)",
+    RETIRE: "CONTROL (SATURATED — unusable)",
+    UNDECIDED: "CONTROL (range unclear)",
+}
+
+# The op4 -> op5 drop below which the Critic probe has no dynamic range to measure.
+# Reported by Llama 2 at 7.2 points and by GPT-3.5 at 2.9; a 31B backbone plausibly
+# sits at 2-4, and under ~2 the probe should be dropped and the limitation stated.
+MEDBULLETS_MIN_USABLE_DROP = 2.0
+MEDBULLETS_PAIR = ("medbullets_op4", "medbullets_op5")
 
 
 # One benchmark's screening outcome across both models and both thinking modes.
@@ -62,6 +78,7 @@ class BenchmarkVerdict:
     n: int
     decision: str
     reason: str
+    is_control: bool = False
 
 
 # Read every summary line the runner has written.
@@ -72,14 +89,37 @@ def load_summaries(results_path: Path) -> list[dict]:
         )
 
     summaries = []
+    skipped_canary = 0
+    skipped_unknown: set[str] = set()
     with results_path.open(encoding="utf-8") as handle:
         for line in handle:
             line = line.strip()
             if not line:
                 continue
             row = json.loads(line)
-            if row.get("type") == "summary":
-                summaries.append(row)
+            if row.get("type") != "summary":
+                continue
+
+            # A canary cell is ten items at a 2,000-token cap. It is the newest
+            # summary for its cell until the real run lands, and the gate would
+            # otherwise read a smoke test as the benchmark's score. Summaries
+            # written before the flag existed are recognised by size instead: no
+            # real cell runs at or below the canary's sample count.
+            if row.get("canary", row["n"] <= CANARY_SAMPLES):
+                skipped_canary += 1
+                continue
+
+            # Summaries survive a benchmark leaving the roster; verdicts cannot,
+            # since every gate decision reads the spec.
+            if row["benchmark"] not in BENCHMARKS:
+                skipped_unknown.add(row["benchmark"])
+                continue
+            summaries.append(row)
+
+    if skipped_canary:
+        print(f"Skipped {skipped_canary} canary summaries.")
+    if skipped_unknown:
+        print(f"Skipped summaries for benchmarks no longer in the roster: {sorted(skipped_unknown)}")
 
     # A cell re-run appends a fresh summary, so keep only the newest of each.
     latest: dict[tuple[str, str, str], dict] = {}
@@ -149,6 +189,7 @@ def build_verdict(benchmark: str, rows: list[dict]) -> BenchmarkVerdict:
         n=gating_row["n"],
         decision=decision,
         reason=reason,
+        is_control=BENCHMARKS[benchmark].is_control,
     )
 
 
@@ -291,8 +332,12 @@ def write_headroom(verdicts: list[BenchmarkVerdict], path: Path) -> None:
         best_on = max(verdict.scores_on.values()) if verdict.scores_on else float("nan")
 
         # Paper benchmarks that survive are the continuity anchors Step 1 requires.
+        # Controls get their gate reading rendered but never a verdict: they answer
+        # whether a result should be believed, not whether it goes in the table.
         label = verdict.decision
-        if verdict.decision == RETAIN and BENCHMARKS[verdict.benchmark].is_paper_benchmark:
+        if verdict.is_control:
+            label = CONTROL_LABEL.get(verdict.decision, verdict.decision)
+        elif verdict.decision == RETAIN and BENCHMARKS[verdict.benchmark].is_paper_benchmark:
             label = "RETAIN (anchor)"
 
         # The interval is asymmetric, so both bounds come from the score itself
@@ -305,8 +350,13 @@ def write_headroom(verdicts: list[BenchmarkVerdict], path: Path) -> None:
             f"| {verdict.error_rate:.1%} | {label} |"
         )
 
-    retained = [v for v in verdicts if v.decision == RETAIN]
-    undecided = [v for v in verdicts if v.decision == UNDECIDED]
+    # Controls are excluded from every tally the stop rule reads. Counting them
+    # would inflate the survivor count and could mask a stop-rule trigger with two
+    # benchmarks that were never gated in the first place.
+    gated = [v for v in verdicts if not v.is_control]
+    controls = [v for v in verdicts if v.is_control]
+    retained = [v for v in gated if v.decision == RETAIN]
+    undecided = [v for v in gated if v.decision == UNDECIDED]
     anchors = [v for v in retained if BENCHMARKS[v.benchmark].is_paper_benchmark]
 
     lines += [
@@ -327,6 +377,14 @@ def write_headroom(verdicts: list[BenchmarkVerdict], path: Path) -> None:
             + ", ".join(v.benchmark for v in undecided)
             + ". Not locked; see exclusions.md for what each needs."
         )
+    if controls:
+        lines.append(
+            f"**Controls (not gated, not counted):** {len(controls)} — "
+            + ", ".join(v.benchmark for v in controls)
+            + "."
+        )
+
+    lines += _control_notes(verdicts)
 
     # Carried into the write-up's methods section alongside the table, because a
     # reader who takes a column at face value would otherwise misread it.
@@ -336,6 +394,52 @@ def write_headroom(verdicts: list[BenchmarkVerdict], path: Path) -> None:
             lines += [f"**`{cell}`.** {note}", ""]
 
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+# Report what the controls say about themselves, ahead of any system to control.
+#
+# Screening cannot measure the Critic — there is no Critic yet. It measures whether
+# the instrument has any range to measure one with, which is a Step 1 question of
+# the same class as saturation, and answers it before a Step 8 row is spent on it.
+def _control_notes(verdicts: list[BenchmarkVerdict]) -> list[str]:
+    by_key = {v.benchmark: v for v in verdicts}
+    op4, op5 = (by_key.get(key) for key in MEDBULLETS_PAIR)
+    if not (op4 and op5):
+        return []
+
+    lines = [
+        "",
+        "## Critic probe — baseline op4 -> op5 drop",
+        "",
+        "op4 and op5 are the same 308 questions; op5 adds one plausible-but-wrong",
+        "option and changes nothing else, so the drop is what one extra distractor",
+        "costs. Rejecting one is the Critic's job. These are single-agent baselines:",
+        "the prediction they will later be tested against is that RecursiveMAS's drop",
+        "is smaller, and shrinks monotonically across depths 1-2-3.",
+        "",
+        "| Model | op4 | op5 | drop | Verdict |",
+        "|---|---|---|---|---|",
+    ]
+
+    for model in sorted(set(op4.scores_off) & set(op5.scores_off)):
+        drop = op4.scores_off[model] - op5.scores_off[model]
+        verdict = (
+            "usable range"
+            if drop >= MEDBULLETS_MIN_USABLE_DROP
+            else f"under {MEDBULLETS_MIN_USABLE_DROP:.0f} points — drop the probe"
+        )
+        lines.append(
+            f"| {model} | {op4.scores_off[model]:.1f} | {op5.scores_off[model]:.1f} "
+            f"| {drop:+.1f} | {verdict} |"
+        )
+
+    lines += [
+        "",
+        f"A baseline drop under {MEDBULLETS_MIN_USABLE_DROP:.0f} points means the probe has no",
+        "dynamic range at this scale. That is a finding, not a failure: it is recorded",
+        "as a limitation in the write-up and the Step 8 row is not spent.",
+    ]
+    return lines
 
 
 # Render the written note explaining every exclusion.
@@ -348,9 +452,10 @@ def write_exclusions(verdicts: list[BenchmarkVerdict], path: Path) -> None:
         "",
     ]
 
-    # Benchmarks that failed the gate empirically.
+    # Benchmarks that failed the gate empirically. Controls are skipped: they were
+    # never gated, so listing them here would read as a benchmark that failed.
     for verdict in sorted(verdicts, key=lambda v: v.benchmark):
-        if verdict.decision == RETAIN:
+        if verdict.decision == RETAIN or verdict.is_control:
             continue
         status = "RETIRED (saturated)" if verdict.decision == RETIRE else "UNDECIDED (not locked)"
         lines += [
@@ -363,6 +468,22 @@ def write_exclusions(verdicts: list[BenchmarkVerdict], path: Path) -> None:
             + f". Metric {verdict.metric_name} over n={verdict.n}.",
             "",
         ]
+
+    # Controls, recorded so the write-up can say what each was for and what it said.
+    controls = [v for v in verdicts if v.is_control]
+    if controls:
+        lines += ["## Controls — screened but not gated", ""]
+        for verdict in sorted(controls, key=lambda v: v.benchmark):
+            lines += [
+                f"### {verdict.benchmark} — {CONTROL_LABEL.get(verdict.decision, verdict.decision)}",
+                "",
+                BENCHMARKS[verdict.benchmark].notes,
+                "",
+                "Scores with thinking disabled: "
+                + ", ".join(f"{m}={s:.1f}" for m, s in sorted(verdict.scores_off.items()))
+                + f". Metric {verdict.metric_name} over n={verdict.n}.",
+                "",
+            ]
 
     # Paper benchmarks the architecture under study cannot run at all.
     lines += ["## Paper benchmarks out of architectural scope", ""]
@@ -423,6 +544,12 @@ def write_manifest(summaries: list[dict], results_path: Path, path: Path) -> Non
                 "max_tokens": spec.max_tokens,
                 "temperature": spec.temperature,
                 "rollouts": spec.rollouts,
+                # Every field below changes what a score means, so each belongs in
+                # the reproducibility record next to the provider pins.
+                "aggregation": spec.aggregation,
+                "choice_letters": spec.choice_letters,
+                "min_difficulty": spec.min_difficulty,
+                "is_control": spec.is_control,
                 "notes": spec.notes,
             }
             for key, spec in BENCHMARKS.items()
@@ -451,9 +578,13 @@ def main() -> int:
     write_exclusions(verdicts, BENCHMARKS_DIR / "exclusions.md")
     write_manifest(summaries, results_path, BENCHMARKS_DIR / "manifest.json")
 
-    retained = sum(1 for v in verdicts if v.decision == RETAIN)
+    gated = [v for v in verdicts if not v.is_control]
+    retained = sum(1 for v in gated if v.decision == RETAIN)
     print(f"Wrote headroom.md, exclusions.md, manifest.json to {BENCHMARKS_DIR}")
-    print(f"Retained {retained} of {len(verdicts)} screened benchmarks.")
+    print(
+        f"Retained {retained} of {len(gated)} gated benchmarks "
+        f"({len(verdicts) - len(gated)} controls not counted)."
+    )
 
     if retained < MIN_SURVIVING_BENCHMARKS:
         print(

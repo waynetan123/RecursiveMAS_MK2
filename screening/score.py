@@ -20,9 +20,10 @@ paper's table. Adds two diagnostics the harness does not report:
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, field
 
-from screening.config import BenchmarkSpec, add_recursivemas_to_path
+from screening.config import AGGREGATION_MEAN, BenchmarkSpec, add_recursivemas_to_path
 from screening.datasets import EvalRecord
 from screening.openrouter import Response
 
@@ -31,7 +32,6 @@ add_recursivemas_to_path()
 from inference_utils.answer_utils import (  # noqa: E402
     compare_answers,
     extract_boxed_answer,
-    extract_choice_answer,
 )
 from inference_utils.lcb_utils import (  # noqa: E402
     clean_raw_output,
@@ -41,6 +41,94 @@ from inference_utils.lcb_utils import (  # noqa: E402
 
 # 95% confidence, used for the Wilson interval around every score.
 Z_95 = 1.959964
+
+# Choice extraction, widened past the vendored A-D range.
+#
+# `answer_utils._extract_choice_core` hardcodes `[A-Da-d]`. On a benchmark whose
+# options run wider — MedXpertQA answers A-J, Medbullets op5 answers A-E — a
+# correct "E" matches nothing, falls through `compare_answers`'s default of "A",
+# and is scored CORRECT on every item whose gold happens to be A. The parse-failure
+# diagnostic cannot catch it either: the answer parsed, just to the wrong letter.
+# Both patterns below are the vendored ones with the character class parameterised,
+# so a benchmark declaring choice_letters="ABCD" is scored bit-for-bit as before.
+_CHOICE_KEYWORDS = (
+    r"(?:final\s*(?:choice|answer)|correct\s*(?:choice|option|answer)|choice|option|answer)"
+)
+_FINAL_LINE_PATTERN = re.compile(
+    r"Final\s*(?:Choice|Answer)\s*:\s*(.+)$", re.IGNORECASE | re.MULTILINE
+)
+
+
+# The two extraction patterns for one option range, compiled once per range.
+def _choice_patterns(letters: str) -> tuple[re.Pattern, re.Pattern]:
+    letter_class = f"[{letters}{letters.lower()}]"
+    return (
+        re.compile(
+            rf"{_CHOICE_KEYWORDS}\s*[:\-]?\s*[\(\[]?\s*({letter_class})\b",
+            re.IGNORECASE,
+        ),
+        re.compile(rf"^\s*[\(\[]?\s*({letter_class})(?:\s*[\)\]]|\s*[:\.\-]|$)"),
+    )
+
+
+# Find the option letter in one candidate string, or None.
+def _extract_choice_core(text: str, letters: str) -> str | None:
+    text = (text or "").strip()
+    if not text:
+        return None
+
+    keyword_pattern, direct_pattern = _choice_patterns(letters)
+
+    # Prefer an explicit "choice/answer/option" mention over a bare leading letter,
+    # which is what the vendored extractor does and why "A. Because ..." in a
+    # preamble does not win against a "Final Choice: C" further down.
+    keyword_match = keyword_pattern.search(text)
+    if keyword_match:
+        return keyword_match.group(1).upper()
+
+    # Accept short direct forms like "A", "(B)", "C: ...".
+    direct_match = direct_pattern.match(text)
+    if direct_match:
+        return direct_match.group(1).upper()
+
+    return None
+
+
+# Extract the chosen option from a full response, in the harness's own order.
+def extract_choice(text: str, letters: str, default: str | None = None) -> str | None:
+    text = text or ""
+
+    # Boxed first, then the last "Final Choice:" line, then the whole response —
+    # the same cascade, in the same order, as answer_utils.extract_choice_answer.
+    candidates = []
+    boxed = extract_boxed_answer(text)
+    if boxed is not None:
+        candidates.append(boxed)
+    final_lines = _FINAL_LINE_PATTERN.findall(text)
+    if final_lines:
+        candidates.append(final_lines[-1])
+    candidates.append(text.strip())
+
+    for candidate in candidates:
+        letter = _extract_choice_core(candidate, letters)
+        if letter is not None:
+            return letter
+
+    # default=None makes an extraction failure observable, which is what the
+    # parse-failure diagnostic needs. Scoring keeps the harness's default of "A"
+    # so that accuracy stays on the published table's scale, and relies on that
+    # diagnostic to say how much of the score is chance credit.
+    if default is None:
+        return None
+    fallback = _extract_choice_core(default, letters)
+    return fallback if fallback is not None else letters[0]
+
+
+# Score one choice item, mirroring compare_answers' choice branch at any width.
+def _compare_choice(gold: str, pred_text: str, letters: str) -> tuple[str, str, bool]:
+    gold_choice = extract_choice(gold, letters, default=letters[0]) or letters[0]
+    pred_choice = extract_choice(pred_text, letters, default=letters[0]) or letters[0]
+    return gold_choice, pred_choice, gold_choice == pred_choice
 
 
 # The outcome for one item in one rollout.
@@ -98,14 +186,14 @@ def wilson_interval(num_correct: int, n: int, z: float = Z_95) -> tuple[float, f
 
 
 # True when the model emitted an answer in the form the extractor expects.
-def _parsed_cleanly(text: str, scorer: str) -> bool:
-    if scorer == "code":
+def _parsed_cleanly(text: str, spec: BenchmarkSpec) -> bool:
+    if spec.scorer == "code":
         return bool(extract_python_code(clean_raw_output(text)).strip())
 
     # For choice questions, default=None makes extraction failure observable;
     # compare_answers would otherwise silently substitute "A".
-    if scorer == "choice":
-        return extract_choice_answer(text, default=None) is not None
+    if spec.scorer == "choice":
+        return extract_choice(text, spec.choice_letters, default=None) is not None
 
     # Math answers must be boxed. extract_pred_answer falls back to the whole
     # response, which would count an unparsed answer as parsed.
@@ -135,12 +223,17 @@ def _score_rollout(
     results = []
     for record, response in zip(records, responses):
         truncated = response.finish_reason == "length"
-        parse_ok = _parsed_cleanly(response.text, spec.scorer)
+        parse_ok = _parsed_cleanly(response.text, spec)
 
-        # Code executes; everything else goes through the extraction cascade.
+        # Code executes; choice questions use the widened extractor above; the rest
+        # go through the vendored normalisation cascade unchanged.
         if spec.scorer == "code":
             correct = _score_code_item(record, response, spec.code_timeout_s)
             pred_parsed, gold_parsed = "", ""
+        elif spec.scorer == "choice":
+            gold_parsed, pred_parsed, correct = _compare_choice(
+                record.gold, response.text, spec.choice_letters
+            )
         else:
             gold_parsed, pred_parsed, correct, _, _ = compare_answers(
                 record.gold, response.text, dataset_name
@@ -213,22 +306,33 @@ def score_benchmark(
             )
 
     n = len(records)
+    total_generations = len(all_items) or 1
 
-    # With one rollout the metric is accuracy; with several it is pass@k, where an
-    # item counts as correct if any rollout solved it.
+    # With one rollout the metric is plain accuracy. With several it depends on the
+    # spec: pass@k counts an item correct if ANY rollout solved it, which is the
+    # paper's protocol and is also what makes a benchmark look saturated when it is
+    # not — ten attempts at a problem the model solves 68% of the time is close to a
+    # guarantee. avg@k takes the mean of independent attempts instead and inflates
+    # nothing.
     if spec.rollouts == 1:
         metric_name = "accuracy"
         num_correct = sum(1 for item in all_items if item.correct)
+        score = 100.0 * num_correct / n if n else 0.0
+    elif spec.aggregation == AGGREGATION_MEAN:
+        metric_name = f"avg@{spec.rollouts}"
+        num_correct = sum(1 for item in all_items if item.correct)
+        score = 100.0 * num_correct / total_generations
+        # The interval is taken at item scale, not generation scale. Rollouts of the
+        # same item are not independent draws, so treating all n*k generations as a
+        # binomial would report an interval roughly sqrt(k) too narrow; item
+        # sampling is what dominates the uncertainty at n in the thousands anyway.
+        num_correct = round(score * n / 100.0)
     else:
         metric_name = f"pass@{spec.rollouts}"
-        solved_any = {item.idx for item in all_items if item.correct}
-        num_correct = len(solved_any)
+        num_correct = len({item.idx for item in all_items if item.correct})
+        score = 100.0 * num_correct / n if n else 0.0
 
-    score = 100.0 * num_correct / n if n else 0.0
     wilson_low, wilson_high = wilson_interval(num_correct, n)
-
-    # Diagnostics are computed over every generation, not just the pass@k winners.
-    total_generations = len(all_items) or 1
 
     return BenchmarkScore(
         benchmark=spec.key,
