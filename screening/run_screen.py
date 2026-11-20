@@ -34,19 +34,17 @@ from screening.config import (
     BenchmarkSpec,
     ModelSpec,
     ScreenConfig,
+    display_name,
     load_config,
 )
 from screening.datasets import EvalRecord, load_benchmark
 from screening.openrouter import OpenRouterClient, Response, assert_thinking_disabled
+from screening.progress import CellProgress
 from screening.prompts import build_messages
 from screening.score import BenchmarkScore, score_benchmark
 
 # Items generated and checked before the rest of a benchmark proceeds.
 THINKING_PROBE_SIZE = 20
-
-# How often a long cell reports progress. Without this a 300-generation cell
-# prints nothing for half an hour and is indistinguishable from a hang.
-PROGRESS_EVERY = 25
 
 # Rough average output tokens per item, for the --dry-run estimate only.
 DRY_RUN_OUTPUT_FRACTION = {"off": 0.35, "on": 0.85}
@@ -94,14 +92,19 @@ async def _generate_cell(
     spec: BenchmarkSpec,
     base_seed: int,
     thinking_key: str,
+    progress: CellProgress,
 ) -> list[list[Response]]:
     thinking = THINKING_MODES[thinking_key]
 
     async def generate(rollout_idx: int, record: EvalRecord) -> Response:
         # Each rollout gets its own seed so pass@k samples differ from one another.
-        return await _generate_one(
+        response = await _generate_one(
             client, model, record, spec, base_seed + rollout_idx, thinking, rollout_idx
         )
+        # Ticked here rather than around the gather below, so the thinking probe's
+        # generations move the bar too instead of appearing as a jump at the start.
+        progress.advance()
+        return response
 
     # Probe a small prefix first, so a provider ignoring enabled=False is caught
     # before the rest of the cell is paid for.
@@ -121,11 +124,9 @@ async def _generate_cell(
         if not (rollout_idx == 0 and item_idx < len(probe))
     ]
 
-    results = await _gather_with_progress(
-        [generate(rollout_idx, records[item_idx]) for rollout_idx, item_idx in jobs],
-        label=f"{spec.key}/{model.key}/{thinking_key}",
-        already_done=len(probe),
-        total=len(records) * spec.rollouts,
+    # asyncio.gather returns in the order it was given, so reassembly stays positional.
+    results = await asyncio.gather(
+        *(generate(rollout_idx, records[item_idx]) for rollout_idx, item_idx in jobs)
     )
 
     # Reassemble into per-rollout lists in the original record order.
@@ -139,41 +140,21 @@ async def _generate_cell(
     return by_rollout
 
 
-# Await many generations, printing a progress line as they land.
-async def _gather_with_progress(
-    coroutines: list,
-    label: str,
-    already_done: int,
-    total: int,
-) -> list[Response]:
-    results: list[Response | None] = [None] * len(coroutines)
-    completed = already_done
-    started = time.monotonic()
-
-    # Each coroutine carries its own index, because asyncio.as_completed yields
-    # fresh awaitables rather than the futures handed to it — so the completed
-    # object cannot be used to look the position back up.
-    async def indexed(idx: int, coroutine):
-        return idx, await coroutine
-
-    tasks = [asyncio.ensure_future(indexed(i, c)) for i, c in enumerate(coroutines)]
-    for future in asyncio.as_completed(tasks):
-        idx, response = await future
-        results[idx] = response
-        completed += 1
-
-        # A long cell would otherwise print nothing at all and look frozen.
-        if completed % PROGRESS_EVERY == 0 or completed == total:
-            elapsed = time.monotonic() - started
-            rate = (completed - already_done) / elapsed if elapsed > 0 else 0.0
-            remaining = (total - completed) / rate if rate > 0 else 0.0
-            print(
-                f"       {label}: {completed}/{total} "
-                f"({rate * 60:.0f}/min, ~{remaining / 60:.0f} min left)",
-                flush=True,
-            )
-
-    return [r for r in results if r is not None]
+# The header for one cell: which model, under which mode, on which benchmark, and
+# how far through the sweep the run is.
+def _cell_header(
+    spec: BenchmarkSpec,
+    model: ModelSpec,
+    thinking_key: str,
+    cell_index: int,
+    cell_total: int,
+) -> str:
+    # Led by a blank line, so each cell reads as its own block rather than running
+    # into the previous cell's summary.
+    return (
+        f"\n{display_name(model.key)} | thinking {thinking_key.upper()} | "
+        f"{display_name(spec.key)} | Cell {cell_index}/{cell_total}"
+    )
 
 
 # Run one (benchmark, model, thinking mode) cell end to end.
@@ -184,35 +165,59 @@ async def run_cell(
     model: ModelSpec,
     thinking_key: str,
     num_samples: int,
+    cell_index: int = 1,
+    cell_total: int = 1,
 ) -> BenchmarkScore:
-    dataset_name, records = load_benchmark(spec, config, num_samples_override=num_samples)
-    print(
-        f"[run] {spec.key:<15} model={model.key:<6} thinking={thinking_key:<3} "
-        f"n={len(records)} rollouts={spec.rollouts}"
-    )
+    progress = CellProgress(_cell_header(spec, model, thinking_key, cell_index, cell_total))
 
-    responses_by_rollout = await _generate_cell(
-        client=client,
-        model=model,
-        records=records,
-        spec=spec,
-        base_seed=config.seed,
-        thinking_key=thinking_key,
-    )
+    # Every path out of here has to end the live line, or a traceback would be
+    # written on top of a half-drawn bar.
+    try:
+        # A cold dataset is a download, so say what is happening before the bar
+        # can exist — its total is not known until the items are in hand.
+        progress.status("loading dataset...")
+        dataset_name, records = load_benchmark(spec, config, num_samples_override=num_samples)
 
-    client.assert_routing(model)
+        # Rollouts are shown only where there is more than one, since the bar
+        # counts generations and n*k would otherwise look like a wrong item count.
+        progress.begin(
+            total=len(records) * spec.rollouts,
+            note=f"{len(records)}x{spec.rollouts}" if spec.rollouts > 1 else "",
+        )
+        responses_by_rollout = await _generate_cell(
+            client=client,
+            model=model,
+            records=records,
+            spec=spec,
+            base_seed=config.seed,
+            thinking_key=thinking_key,
+            progress=progress,
+        )
+        # The finished bar stays on screen as this cell's record of what it ran.
+        progress.close()
 
-    score = score_benchmark(
-        spec=spec,
-        dataset_name=dataset_name,
-        records=records,
-        responses_by_rollout=responses_by_rollout,
-        model_key=model.key,
-        thinking=thinking_key,
-    )
+        client.assert_routing(model)
 
-    _write_results(config, spec, model, thinking_key, records, responses_by_rollout, score)
-    return score
+        # Judged and code benchmarks spend real minutes here — an LLM judge per
+        # generation, or a sandboxed test run per generation — so the phase is
+        # named rather than left as a silent gap after the bar completes.
+        progress.status(f"scoring {len(records) * spec.rollouts} responses ({spec.scorer})...")
+        score = score_benchmark(
+            spec=spec,
+            dataset_name=dataset_name,
+            records=records,
+            responses_by_rollout=responses_by_rollout,
+            model_key=model.key,
+            thinking=thinking_key,
+        )
+
+        _write_results(config, spec, model, thinking_key, records, responses_by_rollout, score)
+
+        # The scoring line has served its purpose; the caller's summary replaces it.
+        progress.clear()
+        return score
+    finally:
+        progress.close()
 
 
 # Append per-sample records and the cell summary to the audit trail.
@@ -448,9 +453,16 @@ async def main_async(args: argparse.Namespace) -> int:
         use_cache=not args.no_cache,
         require_cache=args.rescore_only,
     ) as client:
-        for spec, model, thinking_key in cells:
+        for cell_index, (spec, model, thinking_key) in enumerate(cells, start=1):
             score = await run_cell(
-                client, config, spec, model, thinking_key, num_samples
+                client,
+                config,
+                spec,
+                model,
+                thinking_key,
+                num_samples,
+                cell_index=cell_index,
+                cell_total=len(cells),
             )
             scores.append(score)
             print(

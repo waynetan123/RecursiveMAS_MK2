@@ -1,0 +1,222 @@
+{
+  "generated": "2026-09-06",
+  "seed": 42,
+  "saturation_threshold": 90.0,
+  "judge": {
+    "model": "qwen/qwen3.8-2.4t-a95b",
+    "base_url": "https://openrouter.ai/api/v1"
+  },
+  "models": {
+    "gemma": {
+      "model_id": "google/gemma-4-31b-it",
+      "provider_pin": {
+        "order": [
+          "novita"
+        ],
+        "allow_fallbacks": false,
+        "quantizations": [
+          "bf16"
+        ],
+        "require_parameters": true
+      },
+      "providers_observed": [
+        "Novita"
+      ],
+      "models_served": [
+        "google/gemma-4-31b-it"
+      ]
+    },
+    "qwen": {
+      "model_id": "qwen/qwen3.8-27b",
+      "provider_pin": {
+        "order": [
+          "alibaba"
+        ],
+        "allow_fallbacks": false,
+        "require_parameters": true
+      },
+      "providers_observed": [
+        "Alibaba"
+      ],
+      "models_served": [
+        "qwen/qwen3.8-27b"
+      ]
+    }
+  },
+  "benchmarks": {
+    "math500": {
+      "loader_arg": "math500",
+      "split": "test",
+      "scorer": "math",
+      "max_tokens": 16000,
+      "temperature": 0.6,
+      "rollouts": 1,
+      "aggregation": "pass_at_k",
+      "choice_letters": "ABCD",
+      "min_difficulty": 0.0,
+      "is_control": false,
+      "notes": ""
+    },
+    "gpqa": {
+      "loader_arg": "gpqa",
+      "split": "train",
+      "scorer": "choice",
+      "max_tokens": 16000,
+      "temperature": 0.6,
+      "rollouts": 1,
+      "aggregation": "pass_at_k",
+      "choice_letters": "ABCD",
+      "min_difficulty": 0.0,
+      "is_control": false,
+      "notes": "Gated dataset \u2014 accept the terms at huggingface.co/datasets/Idavidrein/gpqa and set HF_TOKEN. Those terms forbid publishing examples in plain text, so screening_results.jsonl must stay git-ignored."
+    },
+    "medqa": {
+      "loader_arg": "/Users/sjc-waynet/Desktop/RecursiveMAS_MK2/RecursiveMAS/inference/dataset/medqa.json",
+      "split": "train",
+      "scorer": "choice",
+      "max_tokens": 16000,
+      "temperature": 0.6,
+      "rollouts": 1,
+      "aggregation": "pass_at_k",
+      "choice_letters": "ABCD",
+      "min_difficulty": 0.0,
+      "is_control": false,
+      "notes": "300-item local subset shipped with the repo, not the full 1,273-item test set."
+    },
+    "mbppplus": {
+      "loader_arg": "mbppplus",
+      "split": "test",
+      "scorer": "code",
+      "max_tokens": 16000,
+      "temperature": 0.2,
+      "rollouts": 1,
+      "aggregation": "pass_at_k",
+      "choice_letters": "ABCD",
+      "min_difficulty": 0.0,
+      "is_control": false,
+      "notes": ""
+    },
+    "aime25": {
+      "loader_arg": "aime25",
+      "split": "test",
+      "scorer": "math",
+      "max_tokens": 16000,
+      "temperature": 0.6,
+      "rollouts": 10,
+      "aggregation": "pass_at_k",
+      "choice_letters": "ABCD",
+      "min_difficulty": 0.0,
+      "is_control": false,
+      "notes": ""
+    },
+    "aime26": {
+      "loader_arg": "aime26",
+      "split": "train",
+      "scorer": "math",
+      "max_tokens": 16000,
+      "temperature": 0.6,
+      "rollouts": 10,
+      "aggregation": "pass_at_k",
+      "choice_letters": "ABCD",
+      "min_difficulty": 0.0,
+      "is_control": false,
+      "notes": ""
+    },
+    "lcb": {
+      "loader_arg": "lcb",
+      "split": "test",
+      "scorer": "code",
+      "max_tokens": 16000,
+      "temperature": 0.2,
+      "rollouts": 1,
+      "aggregation": "pass_at_k",
+      "choice_letters": "ABCD",
+      "min_difficulty": 0.0,
+      "is_control": false,
+      "notes": "Loader concatenates all six release files: cumulative v1-v6 lite, ~1,055 problems."
+    },
+    "hle": {
+      "loader_arg": "hle",
+      "split": "test",
+      "scorer": "judge",
+      "max_tokens": 16000,
+      "temperature": 0.6,
+      "rollouts": 1,
+      "aggregation": "pass_at_k",
+      "choice_letters": "ABCD",
+      "min_difficulty": 0.0,
+      "is_control": false,
+      "notes": "Gated dataset \u2014 accept the terms at huggingface.co/datasets/cais/hle. Text-only subset; multimodal items dropped because Step 3 disables the vision path. Carries a canary string and must not reach training corpora."
+    },
+    "omni_math": {
+      "loader_arg": "omni_math",
+      "split": "train",
+      "scorer": "judge",
+      "max_tokens": 16000,
+      "temperature": 0.6,
+      "rollouts": 5,
+      "aggregation": "mean",
+      "choice_letters": "ABCD",
+      "min_difficulty": 0.0,
+      "is_control": false,
+      "notes": "Omni-MATH-2-Filtered (martheballon/Omni-MATH-2, non-standard tags removed). Scored by the judge pinned in this file and NEVER by Omni-Judge, which the same audit found wrong in 96.4% of judge disagreements, its dominant failure being exactly the equivalence-checking it exists to perform; re-scoring identical generations moved one frontier model 5.5 points. This project measures effects of about half a point, so (dataset, judge) is one frozen unit. avg@k, never pass@k: pass@10 at a true per-attempt skill of 30% reports 97.2, which is how aime25 and aime26 saturated while their problems had not. Screening runs at --rollouts 1, where the metric is plain accuracy and the trap cannot reappear by accident. No difficulty cut is set in advance: min_difficulty stays 0.0 until the gating cell's score-versus-difficulty curve says where the cut maximises n while leaving 25 points of headroom."
+    },
+    "medxpertqa": {
+      "loader_arg": "medxpertqa",
+      "split": "test",
+      "scorer": "choice",
+      "max_tokens": 16000,
+      "temperature": 0.6,
+      "rollouts": 1,
+      "aggregation": "pass_at_k",
+      "choice_letters": "ABCDEFGHIJ",
+      "min_difficulty": 0.0,
+      "is_control": false,
+      "notes": "Text split only; the MM split is multimodal and Step 3 disables the vision path. Golds are uniform over all ten letters (222-263 each), so no option shuffle is needed and none is applied."
+    },
+    "beyondaime": {
+      "loader_arg": "beyondaime",
+      "split": "test",
+      "scorer": "math",
+      "max_tokens": 16000,
+      "temperature": 0.6,
+      "rollouts": 1,
+      "aggregation": "pass_at_k",
+      "choice_letters": "ABCD",
+      "min_difficulty": 0.0,
+      "is_control": true,
+      "notes": "Not gated: n=100 gives +/-9.8, which compares signs and rough magnitudes and nothing finer. Three jobs. (1) Contamination: Omni-MATH's problems went public in October 2024 and both backbones postdate that, so a gain there could be retrieval; BeyondAIME is the clean twin, same domain and answer format and difficulty band, every problem manually rewritten. (2) Judge independence: positive-integer answers go through compare_answers with no judge in the loop, the only maths benchmark in the set with that property. (3) Threshold calibration for omni_math's difficulty cut, whose labels are self-reported where BeyondAIME's band is externally anchored. CC0."
+    },
+    "medbullets_op4": {
+      "loader_arg": "medbullets_op4",
+      "split": "train",
+      "scorer": "choice",
+      "max_tokens": 16000,
+      "temperature": 0.6,
+      "rollouts": 1,
+      "aggregation": "pass_at_k",
+      "choice_letters": "ABCD",
+      "min_difficulty": 0.0,
+      "is_control": true,
+      "notes": "Not gated: Gemma's canary already scored 90.0, the same neighbourhood as the medqa it would replace, and the questions come from a public X account posting between April 2022 and December 2023 and so are heavily exposed to pretraining. It earns its place as the baseline arm of a paired probe, where both objections cancel: a memorised question is memorised in op4 and op5 alike and contributes nothing to the difference between them. Options are re-shuffled by stable hash because the shipped gold distribution is skewed (A 87, D 68 of 308), and a position effect must not be readable as distractor sensitivity."
+    },
+    "medbullets_op5": {
+      "loader_arg": "medbullets_op5",
+      "split": "train",
+      "scorer": "choice",
+      "max_tokens": 16000,
+      "temperature": 0.6,
+      "rollouts": 1,
+      "aggregation": "pass_at_k",
+      "choice_letters": "ABCDE",
+      "min_difficulty": 0.0,
+      "is_control": true,
+      "notes": "The same 308 questions as medbullets_op4 with one extra distractor and nothing else changed, so the op4->op5 drop isolates one variable: what an additional attractive wrong option costs. Rejecting one is the Critic's job, giving a falsifiable prediction independent of headline accuracy \u2014 RecursiveMAS's drop should be smaller than the single-agent baseline's, and should shrink monotonically across depths 1-2-3. The comparison is within one scale across Step 8 rows, never 4B against 31B, since larger models are less distractible regardless. Paired on identical items, so item difficulty cancels and the +/-4.3 marginal interval does not apply; simulated power at 308 items and five runs detects a 3-point change 98% of the time and a 2-point change 68%. Screening it now asks only whether the instrument has any range: a baseline drop under ~2 points means there is none and the probe should be dropped."
+    }
+  },
+  "cells_completed": 26,
+  "realised_cost_usd": 251.8651,
+  "thinking_mode_caveats": {
+    "qwen/off": "Not a true no-reasoning baseline. reasoning.enabled=false does suppress the labelled thinking channel, and all three probe signals agree it is absent: no thinking tag appears in any of the 11,718 recorded responses, no message.reasoning field is populated, and no reasoning tokens are billed beyond a single outlier in hle. The deliberation is nonetheless still performed \u2014 it has moved into the visible answer as ordinary prose. Qwen emits 1.8-3.4x Gemma's output length, and self-correction discourse markers appear in 68.7% of gpqa, 76.7% of lcb and 84.4% of hle responses, against 18-41% for Gemma on the same items. The thinking-OFF arm therefore compares Gemma answering directly against Qwen reasoning unlabelled, and the two columns are not the same experimental condition. This is recorded rather than corrected: suppressing the working would require a prompt change, and the prompt is held verbatim from the harness so that scores stay on the published table's scale. It does not affect any gate decision, because Qwen scores below Gemma on all eight benchmarks and so sets no gating score."
+  }
+}

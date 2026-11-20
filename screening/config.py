@@ -25,6 +25,29 @@ CACHE_DIR = REPO_ROOT / "screening" / ".cache"
 TOP_P = 0.95
 DEFAULT_SEED = 42
 
+# One generation cap for every benchmark, deliberately uniform.
+#
+# The harness sets this per dataset (run.py:infer_max_new_tokens returns 2,000 for
+# math500, 4,096 for lcb, 16,000 for AIME, 4,000 otherwise) and those values were
+# mirrored here until the first screen measured what the models actually emit. They
+# are not a like-for-like budget across backbones: at a 4,000-token cap Gemma used
+# 19-29% of it and truncated 1-6%, while Qwen used 64-83% and truncated 34% of gpqa,
+# 31% of lcb and 65% of hle. A cap that binds on one backbone and not the other
+# makes the OFF column two different experiments, and a truncated generation is
+# scored wrong, so those Qwen numbers were floors rather than measurements.
+#
+# 16,000 is the measured sufficiency point, not a guess. AIME already ran at this
+# cap: Qwen averaged 5,532 completion tokens there, hit the cap on 0.0% of items and
+# peaked at 15,118. Qwen fills whatever room it is given and then stops below 16k.
+# Gemma is unaffected either way -- it averages 137 tokens on mbppplus against a cap
+# 116 times that size, so raising the ceiling removes a limit it never reaches and
+# costs nothing.
+#
+# The cap is part of the request, and the request is what the response cache is
+# keyed on, so changing this orphans every cached generation made under the old
+# value. Nothing is deleted: setting it back makes those entries reachable again.
+GENERATION_CAP = 16000
+
 # LLM judge for open-ended answers. The paper used Qwen3.5-397B-A17B; this is the
 # nearest available frontier Qwen on OpenRouter. Routed through the same account as
 # generation, so no second key is needed.
@@ -40,8 +63,9 @@ MIN_SURVIVING_BENCHMARKS = 4
 
 # --canary limits: enough to exercise every path, cheap enough to run freely.
 # Two rollouts still exercise the multi-rollout aggregation; a 2,000-token cap keeps
-# the 16k benchmarks from dominating the bill and incidentally exercises the
-# truncation column too. Read by report.py as well, to recognise a canary summary
+# GENERATION_CAP from dominating the bill and incidentally exercises the truncation
+# column too. It also means a canary says nothing about whether the real cap is
+# sufficient -- every canary cell truncates at 2,000 regardless of its spec. Read by report.py as well, to recognise a canary summary
 # written before the flag existed.
 CANARY_SAMPLES = 10
 CANARY_ROLLOUTS = 2
@@ -76,7 +100,8 @@ class ModelSpec:
 # quantizations, which would make a score unattributable to any specific weights.
 MODELS: dict[str, ModelSpec] = {
     # Novita is the only bf16 Gemma endpoint whose completion cap (131k) clears
-    # AIME's 16k requirement; most bf16 providers cap at 8,192 tokens.
+    # GENERATION_CAP; most bf16 providers stop at 8,192, which every benchmark now
+    # exceeds rather than only AIME.
     "gemma": ModelSpec(
         key="gemma",
         model_id="google/gemma-4-31b-it",
@@ -183,9 +208,11 @@ class BenchmarkSpec:
 # sanctions exactly these for ("sequential_scaled", ...), and the two search-QA
 # benchmarks appear only under ("deliberation", ...) — see OUT_OF_SCOPE_BENCHMARKS.
 #
-# Generation caps and temperatures mirror run.py:infer_max_new_tokens and
-# run.py:infer_temperature exactly, so scores land on the same scale as the
-# published table.
+# Temperatures mirror run.py:infer_temperature exactly, so scores land on the same
+# scale as the published table. Generation caps no longer do: every benchmark runs at
+# GENERATION_CAP, for the reasons recorded there. Raising a cap can only raise a
+# score, since a truncated generation is scored wrong, so the paper-comparable
+# reading of an anchor is the floor these numbers now sit above.
 BENCHMARKS: dict[str, BenchmarkSpec] = {
     "math500": BenchmarkSpec(
         key="math500",
@@ -193,7 +220,7 @@ BENCHMARKS: dict[str, BenchmarkSpec] = {
         loader_arg="math500",
         split="test",
         scorer="math",
-        max_tokens=2000,
+        max_tokens=GENERATION_CAP,
     ),
     "gpqa": BenchmarkSpec(
         key="gpqa",
@@ -201,7 +228,7 @@ BENCHMARKS: dict[str, BenchmarkSpec] = {
         loader_arg="gpqa",
         split="train",
         scorer="choice",
-        max_tokens=4000,
+        max_tokens=GENERATION_CAP,
         notes=(
             "Gated dataset — accept the terms at huggingface.co/datasets/Idavidrein/gpqa "
             "and set HF_TOKEN. Those terms forbid publishing examples in plain text, so "
@@ -214,7 +241,7 @@ BENCHMARKS: dict[str, BenchmarkSpec] = {
         loader_arg=str(INFERENCE_DIR / "dataset" / "medqa.json"),
         split="train",
         scorer="choice",
-        max_tokens=4000,
+        max_tokens=GENERATION_CAP,
         notes="300-item local subset shipped with the repo, not the full 1,273-item test set.",
     ),
     "mbppplus": BenchmarkSpec(
@@ -223,7 +250,7 @@ BENCHMARKS: dict[str, BenchmarkSpec] = {
         loader_arg="mbppplus",
         split="test",
         scorer="code",
-        max_tokens=4000,
+        max_tokens=GENERATION_CAP,
         temperature=0.2,
         code_timeout_s=10,
     ),
@@ -233,7 +260,7 @@ BENCHMARKS: dict[str, BenchmarkSpec] = {
         loader_arg="aime25",
         split="test",
         scorer="math",
-        max_tokens=16000,
+        max_tokens=GENERATION_CAP,
         rollouts=10,
     ),
     "aime26": BenchmarkSpec(
@@ -242,7 +269,7 @@ BENCHMARKS: dict[str, BenchmarkSpec] = {
         loader_arg="aime26",
         split="train",
         scorer="math",
-        max_tokens=16000,
+        max_tokens=GENERATION_CAP,
         rollouts=10,
     ),
     "lcb": BenchmarkSpec(
@@ -251,7 +278,7 @@ BENCHMARKS: dict[str, BenchmarkSpec] = {
         loader_arg="lcb",
         split="test",
         scorer="code",
-        max_tokens=4096,
+        max_tokens=GENERATION_CAP,
         temperature=0.2,
         code_timeout_s=6,
         notes="Loader concatenates all six release files: cumulative v1-v6 lite, ~1,055 problems.",
@@ -262,7 +289,7 @@ BENCHMARKS: dict[str, BenchmarkSpec] = {
         loader_arg="hle",
         split="test",
         scorer="judge",
-        max_tokens=4000,
+        max_tokens=GENERATION_CAP,
         is_paper_benchmark=False,
         notes=(
             "Gated dataset — accept the terms at huggingface.co/datasets/cais/hle. "
@@ -283,9 +310,10 @@ BENCHMARKS: dict[str, BenchmarkSpec] = {
         loader_arg="omni_math",
         split="train",
         scorer="judge",
-        # Raised from 8,000: Qwen averaged 13,511 completion tokens on these problems
-        # in the canary, so the old cap turned most of its cell into truncations.
-        max_tokens=16000,
+        # The benchmark that set GENERATION_CAP: Qwen averaged 13,511 completion
+        # tokens on these problems in the canary, so the old 8,000 turned most of its
+        # cell into truncations.
+        max_tokens=GENERATION_CAP,
         rollouts=5,
         aggregation=AGGREGATION_MEAN,
         is_paper_benchmark=False,
@@ -313,9 +341,11 @@ BENCHMARKS: dict[str, BenchmarkSpec] = {
         loader_arg="medxpertqa",
         split="test",
         scorer="choice",
-        # 8,000 rather than medqa's 4,000. Qwen truncated 34% of gpqa at 4,000 and
-        # these items are harder, so the old cap would produce a floor, not a score.
-        max_tokens=8000,
+        # The one cap with no evidence behind it either way: this benchmark has never
+        # run outside a canary, and a canary truncates at 2,000. Qwen's censored gpqa
+        # mean was already 2,563 and these items are harder, so it takes the uniform
+        # cap rather than a guess.
+        max_tokens=GENERATION_CAP,
         # Ten options, A-J. The vendored extractor stops at D and defaults the rest
         # to "A", which scores them correct whenever A is the gold.
         choice_letters="ABCDEFGHIJ",
@@ -333,7 +363,7 @@ BENCHMARKS: dict[str, BenchmarkSpec] = {
         loader_arg="beyondaime",
         split="test",
         scorer="math",
-        max_tokens=16000,
+        max_tokens=GENERATION_CAP,
         is_paper_benchmark=False,
         is_control=True,
         notes=(
@@ -355,7 +385,7 @@ BENCHMARKS: dict[str, BenchmarkSpec] = {
         loader_arg="medbullets_op4",
         split="train",
         scorer="choice",
-        max_tokens=4000,
+        max_tokens=GENERATION_CAP,
         is_paper_benchmark=False,
         is_control=True,
         notes=(
@@ -376,7 +406,7 @@ BENCHMARKS: dict[str, BenchmarkSpec] = {
         loader_arg="medbullets_op5",
         split="train",
         scorer="choice",
-        max_tokens=4000,
+        max_tokens=GENERATION_CAP,
         # A-E: op5 is op4 plus one extra plausible-but-wrong option.
         choice_letters="ABCDE",
         is_paper_benchmark=False,
@@ -397,6 +427,38 @@ BENCHMARKS: dict[str, BenchmarkSpec] = {
         ),
     ),
 }
+
+
+# Labels for the sweep's progress display, for every model and benchmark key whose
+# written form is not just its key capitalised. A key absent from here falls back
+# to the key upper-cased, which is right for the acronyms and wrong for nothing
+# currently defined. Display only: the keys themselves are what the audit trail,
+# the cache and every report are keyed on, and none of them read this.
+DISPLAY_NAMES: dict[str, str] = {
+    # Models.
+    "gemma": "Gemma",
+    "qwen": "Qwen",
+    # Benchmarks.
+    "math500": "MATH500",
+    "gpqa": "GPQA",
+    "medqa": "MedQA",
+    "mbppplus": "MBPP+",
+    "aime25": "AIME25",
+    "aime26": "AIME26",
+    "lcb": "LiveCodeBench",
+    "hle": "HLE",
+    "omni_math": "Omni-MATH",
+    "medxpertqa": "MedXpertQA",
+    "beyondaime": "BeyondAIME",
+    "medbullets_op4": "Medbullets-op4",
+    "medbullets_op5": "Medbullets-op5",
+}
+
+
+# The written form of one model or benchmark key.
+def display_name(key: str) -> str:
+    return DISPLAY_NAMES.get(key, key.upper())
+
 
 # Paper benchmarks the Sequential Style cannot run. Not a saturation judgement:
 # these are excluded by the project's own scoping decision, and are documented in
